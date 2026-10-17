@@ -1,0 +1,9 @@
+node_modules/
+.shadow-cljs/
+.cpcache/
+.sites/
+target/
+dist/
+public/js/
+public/worker/
+.DS_Store
