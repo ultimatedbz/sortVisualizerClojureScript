@@ -5,12 +5,12 @@
  {:app {:target :browser
         :output-dir "public/js"
         :asset-path "js"
-        :modules {:main {:init-fn sort-visualizer.core/init}}
+        :modules {:main {:init-fn sort-visualizer.core/init!}}
         :devtools {:after-load sort-visualizer.core/render!}}
   :worker {:target :browser
            :output-dir "public/worker"
            :asset-path "worker"
-           :modules {:worker {:init-fn sort-visualizer.worker/init :web-worker true}}}
+           :modules {:worker {:init-fn sort-visualizer.worker/init! :web-worker true}}}
   :test {:target :node-test
          :output-to "target/tests.js"
          :ns-regexp "-test$"

@@ -16,5 +16,5 @@
                                            (.-message error)
                                            "The algorithm could not run.")}))))))
 
-(defn init []
+(defn init! []
   (set! (.-onmessage js/self) handle-message!))

@@ -4,55 +4,53 @@
             [reagent.dom.client :as rdom]
             [sort-visualizer.catalog :as catalog]
             [sort-visualizer.references :as references]
-            [sort-visualizer.custom :as custom]))
+            [sort-visualizer.custom :as custom]
+            [sort-visualizer.playback :as playback]))
 
-(defn read-setting [key fallback]
+(defn read-setting! [key fallback]
   (try (or (.getItem js/localStorage key) fallback) (catch :default _ fallback)))
 (defn save-setting! [key value]
   (try (.setItem js/localStorage key value) (catch :default _ nil)))
-(defn make-values [n distribution]
-  (let [ordered (vec (range 1 (inc n)))]
-    (case distribution
-      "reversed" (vec (reverse ordered))
-      "nearly" (reduce (fn [v _] (let [i (rand-int n) j (min (dec n) (inc i))] (assoc v i (v j) j (v i)))) ordered (range (max 2 (quot n 6))))
-      "few" (vec (repeatedly n #(* 8 (inc (rand-int 6)))))
-      (vec (shuffle ordered)))))
-(defonce state (r/atom {:algorithm :quick :count 48 :distribution "random" :values (make-values 48 "random")
+(defn read-code! []
+  (let [code (read-setting! "sort-code" custom/default-code)]
+    (if (= code custom/legacy-default-code) custom/default-code code)))
+(defonce state (r/atom {:algorithm :quick :count 48 :distribution "random"
+                       :values (playback/make-values 48 "random" (rand-int 2147483647))
                        :frames nil :index 0 :playing? false :generating? false :speed 80
-                       :sound? (= "true" (read-setting "sort-sound" "false")) :tab :overview
-                       :code (read-setting "sort-code" custom/default-code) :language "ClojureScript"
+                       :request-id 0 :clock nil
+                       :sound? (= "true" (read-setting! "sort-sound" "false")) :tab :overview
+                       :code (read-code!) :language "ClojureScript"
                        :error nil :result-status nil :result-message nil :copied? false}))
+;; These handles belong to browser resources; sorting and playback use plain values.
 (defonce worker (atom nil))
-(defonce request-id (atom 0))
 (defonce worker-timeout (atom nil))
 (defonce audio-context (atom nil))
 (defonce root (atom nil))
-(defonce clock-state (atom {:last 0 :credit 0}))
 (defonce ticker (atom nil))
 (defn by-id [id] (first (filter #(= id (:id %)) catalog/algorithms)))
-(defn current-algorithm [] (or (by-id (:algorithm @state)) {:name "Custom sort" :family "Your algorithm" :summary "An algorithm written by you, running in the ClojureScript playground."}))
-(defn frame [] (or (get (:frames @state) (:index @state)) {:values (:values @state) :active [] :sorted [] :comparisons 0 :writes 0 :note "Choose an algorithm, then press Start sort."}))
+(defn current-algorithm [app-state]
+  (or (by-id (:algorithm app-state))
+      {:name "Custom sort" :family "Your algorithm"
+       :summary "An algorithm written by you, running in the ClojureScript playground."}))
 (defn cancel-worker! []
   (when @worker (.terminate @worker) (reset! worker nil))
-  (when @worker-timeout (js/clearTimeout @worker-timeout) (reset! worker-timeout nil))
-  (swap! request-id inc))
+  (when @worker-timeout (js/clearTimeout @worker-timeout) (reset! worker-timeout nil)))
 (defn clear-trace! []
   (cancel-worker!)
-  (swap! state assoc :frames nil :index 0 :playing? false :generating? false :error nil :result-status nil :result-message nil))
-(defn regenerate! []
-  (clear-trace!)
-  (swap! state assoc :values (make-values (:count @state) (:distribution @state))))
+  (swap! state playback/clear-trace))
+(defn regenerate!
+  ([] (regenerate! {}))
+  ([settings]
+   (cancel-worker!)
+   (swap! state playback/regenerate (rand-int 2147483647) settings)))
 (defn update-code! [code]
-  (when (= :custom (:algorithm @state)) (clear-trace!))
-  (swap! state assoc :code code)
+  (when (= :custom (:algorithm @state)) (cancel-worker!))
+  (swap! state playback/update-code code)
   (save-setting! "sort-code" code))
 (defn select-algorithm! [id]
-  (clear-trace!)
-  (let [n (if (= id :bogo) (min 8 (:count @state)) (max 8 (:count @state)))
-        language (:language @state)]
-    (swap! state assoc :algorithm id :count n :values (make-values n (:distribution @state))
-           :language (if (or (= language "ClojureScript") (get-in references/codes [id language])) language "ClojureScript"))
-    (.replaceState js/history nil "" (str "#/" (name id)))))
+  (cancel-worker!)
+  (swap! state playback/select-algorithm id (rand-int 2147483647))
+  (.replaceState js/history nil "" (str "#/" (name id))))
 (defn enable-audio! []
   (try
     (when-not @audio-context
@@ -74,59 +72,55 @@
       (catch :default _ nil))))
 (defn request-trace! [mode]
   (cancel-worker!)
-  (swap! state assoc :generating? true :error nil :playing? false :frames nil :index 0
-         :result-status nil :result-message nil)
-  (try
-    (let [id @request-id w (js/Worker. "worker/worker.js")]
-      (reset! worker w)
-      (set! (.-onmessage w)
-            (fn [event]
-              (let [data (js->clj (.-data event) :keywordize-keys true)]
-                (when (= id @request-id (:id data))
+  (let [prepared (swap! state playback/prepare)
+        id (:request-id prepared)]
+    (try
+      (let [w (js/Worker. "worker/worker.js")]
+        (reset! worker w)
+        (set! (.-onmessage w)
+              (fn [event]
+                (let [data (js->clj (.-data event) :keywordize-keys true)]
+                  (when (and (= id (:id data)) (playback/pending? @state id))
+                    (cancel-worker!)
+                    (if-let [error (:error data)]
+                      (swap! state playback/reject-trace id error)
+                      (swap! state playback/accept-trace id (:result data) mode (.now js/performance)))))))
+        (set! (.-onerror w)
+              (fn [_]
+                (when (playback/pending? @state id)
                   (cancel-worker!)
-                  (if-let [error (:error data)]
-                    (swap! state assoc :generating? false :error error)
-                    (let [result (:result data)
-                          frames (when (seq (:frames result)) (:frames result))
-                          status (keyword (:status result))
-                          final-index (max 0 (dec (count frames)))]
-                      (reset! clock-state {:last (.now js/performance) :credit 0})
-                      (swap! state assoc :frames frames :index (if (= mode :step) (min 1 final-index) 0)
-                             :generating? false
-                             :playing? (and (= mode :play) (pos? final-index) (not= :invalid status))
-                             :error (when (= :invalid status) (:message result))
-                             :result-status status :result-message (:message result))))))))
-      (set! (.-onerror w) (fn [_] (when (= id @request-id) (cancel-worker!) (swap! state assoc :generating? false :error "The algorithm could not run. Try again or check your code."))))
-      (reset! worker-timeout (js/setTimeout (fn [] (when (= id @request-id) (cancel-worker!) (swap! state assoc :generating? false :error "Execution stopped after 8 seconds. Check for an infinite loop or reduce the input size."))) 8000))
-      (.postMessage w (clj->js {:id id :algorithm (name (:algorithm @state)) :values (:values @state) :code (:code @state)})))
-    (catch :default _
-      (cancel-worker!)
-      (swap! state assoc :generating? false :error "The sorting worker could not start. Reload the page and try again."))))
+                  (swap! state playback/reject-trace id "The algorithm could not run. Try again or check your code."))))
+        (reset! worker-timeout
+                (js/setTimeout
+                 (fn []
+                   (when (playback/pending? @state id)
+                     (cancel-worker!)
+                     (swap! state playback/reject-trace id "Execution stopped after 8 seconds. Check for an infinite loop or reduce the input size.")))
+                 8000))
+        (.postMessage w (clj->js {:id id :algorithm (name (:algorithm prepared))
+                                :values (:values prepared) :code (:code prepared)})))
+      (catch :default _
+        (cancel-worker!)
+        (swap! state playback/reject-trace id "The sorting worker could not start. Reload the page and try again.")))))
 (defn play! []
   (when (:sound? @state) (enable-audio!))
   (cond
-    (:playing? @state) (swap! state assoc :playing? false)
+    (:playing? @state) (swap! state playback/pause)
     (:generating? @state) nil
-    (seq (:frames @state)) (do (when (= (:index @state) (dec (count (:frames @state)))) (swap! state assoc :index 0))
-                              (reset! clock-state {:last (.now js/performance) :credit 0})
-                              (swap! state assoc :playing? true))
+    (seq (:frames @state)) (swap! state playback/play (.now js/performance))
     :else (request-trace! :play)))
 (defn step! []
-  (swap! state assoc :playing? false)
-  (if (seq (:frames @state))
-    (swap! state update :index #(min (dec (count (:frames @state))) (inc %)))
-    (request-trace! :step)))
-(defn restart! [] (swap! state assoc :index 0 :playing? false))
+  (when-not (:generating? @state)
+    (if (seq (:frames @state))
+      (swap! state playback/step)
+      (request-trace! :step))))
+(defn restart! [] (swap! state playback/restart))
 (defn tick! []
-  (let [now (.now js/performance)]
-    (when (:playing? @state)
-      (let [credit (+ (:credit @clock-state) (* (/ (- now (:last @clock-state)) 1000) (:speed @state)))
-            steps (js/Math.floor credit) final-index (dec (count (:frames @state)))]
-        (reset! clock-state {:last now :credit (- credit steps)})
-        (when (pos? steps)
-          (let [index (min final-index (+ (:index @state) steps))]
-            (swap! state assoc :index index :playing? (< index final-index))
-            (tone! (frame))))))))
+  (let [before @state]
+    (when (:playing? before)
+      (let [after (swap! state playback/tick (.now js/performance))]
+        (when (not= (:index before) (:index after))
+          (tone! (playback/current-frame after)))))))
 
 (defn icon [kind]
   [:svg {:width 18 :height 18 :viewBox "0 0 24 24" :fill "none" :stroke "currentColor" :stroke-width 1.8 :stroke-linecap "round" :stroke-linejoin "round" :aria-hidden true}
@@ -157,7 +151,7 @@
    [:button.custom-nav {:class (when (= :custom (:algorithm @state)) "selected") :on-click #(do (select-algorithm! :custom) (swap! state assoc :tab :playground))} [icon :code] "Write your own" [:span "↗"]]
    [:div.sidebar-note [:span.status-dot] "All sorting runs in your browser."]])
 (defn visualization []
-  (let [f (frame) values (:values f) active (set (:active f)) sorted (set (:sorted f))
+  (let [f (playback/current-frame @state) values (:values f) active (set (:active f)) sorted (set (:sorted f))
         n (count values) max-value (apply max 1 values) complete? (and (seq (:frames @state)) (= (:index @state) (dec (count (:frames @state)))))]
     [:div.visualization
      [:div.graph-top [:span "ARRAY VIEW"] [:div.legend [:span [:i.dot.unsorted] "Unsorted"] [:span [:i.dot.active] "Active"] [:span [:i.dot.sorted] "Sorted"]]]
@@ -181,20 +175,20 @@
       [:button.icon-button {:on-click step! :disabled busy? :title "Step forward" :aria-label "Step forward"} [icon :step]]
       [:button.icon-button {:on-click restart! :disabled (or busy? (not (:frames @state))) :title "Restart animation" :aria-label "Restart animation"} [icon :reset]]
       [:span.control-divider]
-      [:button.text-button {:on-click regenerate! :title "Generate a new array"} [icon :shuffle] "Shuffle"]]
+      [:button.text-button {:on-click #(regenerate!) :title "Generate a new array"} [icon :shuffle] "Shuffle"]]
      [:div.speed-control [:label {:for "speed"} "Speed" [:strong (str (:speed @state) " steps/s")]]
       [:input {:id "speed" :type "range" :min 10 :max 500 :step 10 :value (:speed @state) :on-change #(swap! state assoc :speed (js/parseInt (.. % -target -value)))}]]]))
 (defn progress []
   [:input.timeline {:type "range" :min 0 :max (max 0 (dec (count (:frames @state)))) :step 1 :value (:index @state)
                     :disabled (< (count (:frames @state)) 2) :aria-label "Animation progress"
-                    :on-change #(swap! state assoc :index (js/parseInt (.. % -target -value)) :playing? false)}])
+                    :on-change #(swap! state playback/scrub (js/parseInt (.. % -target -value)))}])
 (defn settings []
   [:div.settings
    [:div.array-control [:label {:for "array-size"} "Array size" [:strong (:count @state)]]
     [:input {:id "array-size" :type "range" :min (if (= :bogo (:algorithm @state)) 2 8) :max (if (= :bogo (:algorithm @state)) 8 128) :step 1 :value (:count @state)
-             :on-change #(do (swap! state assoc :count (js/parseInt (.. % -target -value))) (regenerate!))}]]
+             :on-change #(regenerate! {:count (js/parseInt (.. % -target -value))})}]]
    [:div.distribution-control [:label {:for "distribution"} "Starting order"]
-    [:select {:id "distribution" :value (:distribution @state) :on-change #(do (swap! state assoc :distribution (.. % -target -value)) (regenerate!))}
+    [:select {:id "distribution" :value (:distribution @state) :on-change #(regenerate! {:distribution (.. % -target -value)})}
      [:option {:value "random"} "Random"] [:option {:value "nearly"} "Nearly sorted"] [:option {:value "reversed"} "Reversed"] [:option {:value "few"} "Few unique values"]]]
    [:button.sound-button {:aria-pressed (:sound? @state) :on-click #(do (enable-audio!) (swap! state update :sound? not) (save-setting! "sort-sound" (str (:sound? @state))))}
     [icon (if (:sound? @state) :sound :mute)] (if (:sound? @state) "Sound on" "Sound off")]])
@@ -208,14 +202,19 @@
       ^{:key label} [:div.complexity-row [:span label] [:strong value]])
     [:div.stability [:span "Stable sort"] [:span (if (:stable? a) "Yes" "No")]]
     [:p.complexity-note "Complexities describe the standard algorithm; animation trace storage is additional."]]])
-(defn displayed-code [a] (if (= :custom (:algorithm @state)) (:code @state) (if (= "ClojureScript" (:language @state)) (:code a) (get-in references/codes [(:id a) (:language @state)]))))
+(defn displayed-code [a app-state]
+  (if (= :custom (:algorithm app-state))
+    (:code app-state)
+    (if (= "ClojureScript" (:language app-state))
+      (:code a)
+      (get-in references/codes [(:id a) (:language app-state)]))))
 (defn code-view [a]
   [:div.code-content
    [:div.code-toolbar [:div [:span.code-dot] "IMPLEMENTATION"]
     [:select {:aria-label "Code language" :value (:language @state) :on-change #(swap! state assoc :language (.. % -target -value))}
      (for [lang (cons "ClojureScript" (sort (keys (get references/codes (:id a)))))] ^{:key lang} [:option {:value lang} lang])]
-    [:button.text-button {:on-click #(when-let [clipboard (.-clipboard js/navigator)] (-> (.writeText clipboard (or (displayed-code a) "")) (.then (fn [] (swap! state assoc :copied? true) (js/setTimeout (fn [] (swap! state assoc :copied? false)) 1800))) (.catch (fn [_] (swap! state assoc :error "Clipboard access is unavailable. Select the code to copy it.")))))} [icon :copy] (if (:copied? @state) "Copied" "Copy code")]]
-   [:pre [:code (or (displayed-code a) "Choose an algorithm to view its implementation.")]]
+    [:button.text-button {:on-click #(when-let [clipboard (.-clipboard js/navigator)] (-> (.writeText clipboard (or (displayed-code a @state) "")) (.then (fn [] (swap! state assoc :copied? true) (js/setTimeout (fn [] (swap! state assoc :copied? false)) 1800))) (.catch (fn [_] (swap! state assoc :error "Clipboard access is unavailable. Select the code to copy it.")))))} [icon :copy] (if (:copied? @state) "Copied" "Copy code")]]
+   [:pre [:code (or (displayed-code a @state) "Choose an algorithm to view its implementation.")]]
    [:p.code-note (if (= "ClojureScript" (:language @state)) "A concise reference implementation. The animated engine adds operation tracking." "Reference example preserved from the original Sort Visualizer.")]])
 (defn playground []
   [:div.playground-content
@@ -225,12 +224,18 @@
    [:textarea.code-editor {:id "custom-code" :spell-check false :value (:code @state)
                           :on-change #(update-code! (.. % -target -value))}]
    [:details.api-docs [:summary "Playground API & examples"]
-    [:p "Define your function and call it at the end. The current array is available through these functions:"]
-    [:dl (for [[code desc] [["(size)" "Number of values in the array."] ["(value i)" "Read the value at zero-based index i."] ["(compare! i j)" "Compare values and record a frame; returns negative, zero, or positive."] ["(swap! i j)" "Swap two values and record a frame."] ["(write! i v)" "Write a finite numeric value and record a frame."] ["(snapshot! [i j] \"note\")" "Highlight indices and add an explanation."]]] ^{:key code} [:div [:dt [:code code]] [:dd desc]])]
+    [:p "Return a function of one state argument, for example (fn [state] ...). Each operation returns a new state; pass that state to the next operation and return the final state:"]
+    [:dl (for [[code desc] [["(size state)" "Number of values in the state."]
+                           ["(value state i)" "Read the value at zero-based index i."]
+                           ["(compare-at state i j)" "Return [next-state comparison], recording a frame. The comparison is negative, zero, or positive."]
+                           ["(swap-at state i j)" "Return a new state with two values exchanged and a frame recorded."]
+                           ["(write-at state i v)" "Return a new state with a finite numeric value written and a frame recorded."]
+                           ["(snapshot state [i j] \"note\")" "Return a new state with highlighted indices and an explanation."]]]
+           ^{:key code} [:div [:dt [:code code]] [:dd desc]])]
     [:p "Runs are isolated in a worker, limited to 8 seconds and a bounded number of operations. The final array must be sorted and preserve every input value."]]
    [:button.text-button {:on-click #(update-code! custom/default-code)} [icon :reset] "Restore example"]])
 (defn learning []
-  (let [a (current-algorithm)]
+  (let [a (current-algorithm @state)]
     [:section.learning {:aria-label "Learn about the algorithm"}
      [:div.tabs {:role "tablist" :aria-label "Algorithm details"}
       (for [[id title] [[:overview "Overview"] [:code "Source code"] [:playground "Playground"]]]
@@ -239,7 +244,7 @@
      [:div {:id "learning-panel" :role "tabpanel" :aria-labelledby (str "tab-" (name (:tab @state)))}
       (case (:tab @state) :code [code-view a] :playground [playground] [overview a])]]))
 (defn app []
-  (let [a (current-algorithm) f (frame)]
+  (let [a (current-algorithm @state) f (playback/current-frame @state)]
     [:div.app-shell
      [:header.site-header [:a.brand {:href "#/quick" :on-click #(select-algorithm! :quick)} [logo] [:span "sort" [:strong "visualizer"]] [:span.brand-edition "CLJS"]]
       [:div.header-right [:span.header-note "A LITTLE ORDER. A LOT TO LEARN."] [:a.source-link {:href "https://github.com/ultimatedbz/sortVisualizerClojureScript" :target "_blank" :rel "noreferrer"} "View source" [icon :arrow]]]]
@@ -267,7 +272,7 @@
     (when (or (by-id id) (= id :custom))
       (when-not (= id (:algorithm @state)) (select-algorithm! id))
       (when (= id :custom) (swap! state assoc :tab :playground)))))
-(defn init []
+(defn init! []
   (read-route!)
   (.addEventListener js/window "hashchange" read-route!)
   (when @ticker (js/clearInterval @ticker))

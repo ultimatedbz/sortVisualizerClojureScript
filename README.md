@@ -4,7 +4,7 @@ A sorting algorithm playground rewritten in ClojureScript from [Myphz/sortvisual
 
 The application is a static site built with ClojureScript, Reagent, React, and shadow-cljs. Sorting runs in a Web Worker and produces an operation trace that the interface can play back. Custom code runs through [SCI](https://github.com/babashka/sci).
 
-[Open the hosted sorting lab](https://sort-visualizer-clojurescript.ultimatedbz.chatgpt.site) (owner-private, requires your sign-in).
+[Open the hosted sorting lab](https://sort-visualizer-clojurescript.ultimatedbz.chatgpt.site). It is public and requires no sign-in.
 
 ## Explore
 
@@ -39,34 +39,40 @@ Deploy the contents of `dist/` to a static web host. No Python server, database,
 
 ## Write a custom sort
 
-Custom programs operate on the current array through six supplied functions. The editor evaluates ClojureScript-compatible SCI forms; it does not compile arbitrary ClojureScript namespaces or support browser interop.
+Custom programs receive an immutable state value and return the next state. The editor evaluates ClojureScript-compatible SCI forms; it does not compile arbitrary ClojureScript namespaces or support browser interop. Each operation returns a new value, so retain and pass its result to the next operation.
 
 | Function | Behavior |
 | --- | --- |
-| `(size)` | Return the number of values. |
-| `(value i)` | Read the value at zero-based index `i`. |
-| `(compare! i j)` | Compare two values, record a frame, and return a negative number, zero, or a positive number. |
-| `(swap! i j)` | Swap two positions and record a frame. This editor binding is an array operation, not the usual atom function. |
-| `(write! i number)` | Write a finite number and record a frame. |
-| `(snapshot! [i j] "note")` | Record a frame highlighting the supplied indices with a short explanation. |
+| `(size state)` | Return the number of values without changing the state. |
+| `(value state i)` | Read the value at zero-based index `i`. |
+| `(compare-at state i j)` | Return `[next-state order]`, recording a comparison. `order` is negative, zero, or positive. |
+| `(swap-at state i j)` | Return a state with the two positions exchanged and a new frame. |
+| `(write-at state i number)` | Return a state with a finite value at the given position and a new frame. |
+| `(snapshot state [i j] "note")` | Return a state with a frame highlighting the supplied indices. |
 
-Define a function and call it at the end of the program:
+The program must evaluate to a function of state. For example:
 
 ```clojure
-(defn sort! []
-  (doseq [i (range (size))]
-    (let [smallest
-          (reduce (fn [best j]
-                    (if (neg? (compare! j best)) j best))
-                  i
-                  (range (inc i) (size)))]
-      (when (not= i smallest)
-        (swap! i smallest)))))
-
-(sort!)
+(fn [state]
+  (reduce
+    (fn [state i]
+      (let [[state smallest]
+            (reduce
+              (fn [[state best] j]
+                (let [[state order] (compare-at state j best)]
+                  [state (if (neg? order) j best)]))
+              [state i]
+              (range (inc i) (size state)))]
+        (swap-at state i smallest)))
+    state
+    (range (size state))))
 ```
 
-On completion, the app checks ascending order and preservation of every original value, including duplicates. Invalid indices, malformed code, and incomplete sorts produce errors. A worker timeout and operation limits stop runaway programs. Code executes locally in the browser; there is no code-submission service.
+You can also define a named function with `defn` and leave its name as the final expression. Do not invoke it yourself; the worker supplies the initial state.
+
+On completion, the app validates the returned state and trace, ascending order, and preservation of every original value, including duplicates. Invalid indices, malformed code, and incomplete sorts produce errors. State transitions carry their operation budget explicitly; pure `size` and `value` reads consume no hidden counter. A worker timeout also stops programs that loop without producing a result. Code executes locally in the browser; there is no code-submission service.
+
+The former implicit-state API (`compare!`, `swap!`, `write!`, `snapshot!`) has been replaced. The stored original example upgrades automatically. Edited programs are preserved and receive migration guidance: accept `state`, pass it to each operation, and return the resulting state. Use `reduce` or `loop` to carry state instead of relying on `doseq` side effects.
 
 The ClojureScript reference tab shows ordinary functions over vectors. Those examples return sorted vectors; adapt them to the instrumented API above to animate them in the custom editor.
 
@@ -74,14 +80,17 @@ The ClojureScript reference tab shows ordinary functions over vectors. Those exa
 
 | Path | Purpose |
 | --- | --- |
-| `src/sort_visualizer/core.cljs` | Reagent UI, playback, and worker coordination. |
-| `src/sort_visualizer/algorithms.cljs` | Fifteen instrumented sorting algorithms. |
-| `src/sort_visualizer/custom.cljs` | SCI bindings, bounds, and result validation. |
+| `src/sort_visualizer/core.cljs` | UI event handlers and browser effect boundaries. |
+| `src/sort_visualizer/playback.cljs` | Pure playback transitions and seeded input generation. |
+| `src/sort_visualizer/algorithms.cljs` | Fifteen pure sorting algorithms and immutable trace construction. |
+| `src/sort_visualizer/custom.cljs` | Pure custom-sort operations, SCI bindings, and result validation. |
 | `src/sort_visualizer/worker.cljs` | Browser worker entry point. |
 | `src/sort_visualizer/catalog.cljs` | Educational descriptions and ClojureScript examples. |
 | `src/sort_visualizer/references.cljs` | Original multilingual reference snippets. |
 | `test/sort_visualizer/` | Algorithm, interpreter, and educational example tests. |
 | `docs/PORTING.md` | Feature parity and intentional differences from the original. |
+
+Sorting, trace recording, input generation, and playback calculations operate on persistent maps and vectors. Mutable application state is committed at UI event boundaries; browser effects such as workers, timers, audio, rendering, and local storage remain explicitly effectful. An exclamation suffix identifies those effectful handlers, not ordinary algorithm transformations.
 
 ## Attribution
 

@@ -124,3 +124,53 @@
   (is (thrown? js/Error (algorithms/generate-trace :unknown [1 2])))
   (is (thrown? js/Error (algorithms/generate-trace :quick [js/NaN 1])))
   (is (thrown? js/Error (algorithms/generate-trace :quick [js/Infinity 1]))))
+
+(deftest traces-can-branch-from-shared-snapshots
+  ;; A frame is also a reusable input value. Running independent algorithms
+  ;; from the same frame must not change that frame or its containing trace.
+  (doseq [algorithm algorithms/algorithm-order]
+    (let [input [4 1 3 2]
+          original (algorithms/generate-trace algorithm input)
+          frames (:frames original)
+          frame (nth frames (quot (count frames) 2))
+          shared-values (:values frame)
+          original-before (pr-str original)
+          frame-before (pr-str frame)
+          first-branch (algorithms/generate-trace :merge shared-values)
+          first-branch-before (pr-str first-branch)
+          second-branch (algorithms/generate-trace :quick (assoc shared-values 0 -10))
+          repeated-branch (algorithms/generate-trace :merge shared-values)]
+      (is (= original-before (pr-str original)) (str algorithm " keeps its full earlier trace"))
+      (is (= frame-before (pr-str frame)) (str algorithm " keeps the shared snapshot"))
+      (is (= first-branch-before (pr-str first-branch)) "Later branches leave completed branches unchanged")
+      (is (= first-branch repeated-branch) "The same state produces the same branch after unrelated work")
+      (is (= (vec (sort shared-values)) (final-values first-branch)))
+      (is (= (vec (sort (assoc shared-values 0 -10))) (final-values second-branch)))
+      (is (= [4 1 3 2] input)))))
+
+(deftest sampled-trace-snapshots-remain-reusable
+  ;; This trace crosses the capture bound and downsamples multiple times.
+  ;; Reusing its retained snapshots must preserve counters and frame history.
+  (let [original (algorithms/generate-trace :bubble (vec (reverse (range 128))))
+        original-before (pr-str original)
+        frames (:frames original)
+        selected [(first frames) (nth frames (quot (count frames) 2)) (peek frames)]
+        branches (mapv #(algorithms/generate-trace :heap (:values %)) selected)]
+    (is (= original-before (pr-str original)))
+    (is (= [0 0] ((juxt :comparisons :writes) (first frames))))
+    (is (= [8128 16256] ((juxt :comparisons :writes) (peek frames))))
+    (doseq [[source branch] (map vector selected branches)]
+      (is (= (:values source) (:values (first (:frames branch)))))
+      (is (= (vec (range 128)) (final-values branch)))
+      (is (= [0 0] ((juxt :comparisons :writes) (first (:frames branch))))))))
+
+(deftest bogo-seed-is-local-to-each-pure-run
+  (let [input [1 2 3 4 5 6 8 7]
+        first-run (algorithms/generate-trace :bogo input)
+        first-run-before (pr-str first-run)
+        other-run (algorithms/generate-trace :bogo [4 3 2 1])
+        replay (algorithms/generate-trace :bogo input)]
+    (is (= :complete (:status other-run)))
+    (is (= first-run replay) "Another bogo run cannot advance this run's seed")
+    (is (= first-run-before (pr-str first-run)))
+    (is (= input (:values (first (:frames first-run)))))))

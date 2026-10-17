@@ -1,5 +1,5 @@
 (ns sort-visualizer.custom
-  "A deliberately small, instrumented API for running custom sorting code."
+  "A small, immutable state-in/state-out API for custom sorting code."
   (:require [clojure.string :as str]
             [sci.core :as sci]))
 
@@ -7,12 +7,12 @@
 (def max-frames 20000)
 
 (def ^:private allowed-symbols
-  ;; Keep JavaScript interop and reflection out of the DSL. An allowlist also
-  ;; prevents indirect access through aget, type, resolve, or namespace maps.
-  '[size value compare! swap! write! snapshot!
+  ;; Immutable collection, control-flow and math operations, plus named helpers
+  ;; in the fresh interpreter context. No JavaScript or mutable reference API.
+  '[size value compare-at swap-at write-at snapshot
     def defn defn- fn fn* let let* letfn letfn* loop loop* recur do if if-not
     when when-not if-let when-let if-some when-some cond case case* and or not
-    doseq dotimes for while comment quote -> ->> as-> cond-> cond->> some-> some->>
+    comment quote -> ->> as-> cond-> cond->> some-> some->>
     = not= < <= > >= compare + - * / inc dec mod rem quot max min abs
     neg? pos? zero? even? odd? number? integer? int long double boolean
     true? false? nil? some? identity constantly complement partial comp juxt
@@ -27,138 +27,205 @@
     zipmap frequencies group-by partition partition-all partition-by split-at
     split-with subvec butlast drop-last take-last interleave interpose
     seq sequence seq? sequential? vector? list? map? set? coll? string? keyword?
-    symbol? fn? ifn? str pr-str name namespace keyword symbol
-    atom deref reset! volatile! vreset! vswap!
-    chunked-seq? chunk-first chunk-rest chunk-next chunk-cons chunk-append
-    chunk-buffer chunk chunked-next chunked-rest unchecked-inc unchecked-inc-int])
+    symbol? fn? ifn? str pr-str name namespace keyword symbol])
+
+(def legacy-default-code
+  "The previous default, retained only to migrate a saved editor draft."
+  ";; Find the smallest remaining value, then put it in place.\n(defn sort! []\n  (doseq [i (range (size))]\n    (let [smallest\n          (reduce (fn [best j]\n                    (if (neg? (compare! j best)) j best))\n                  i\n                  (range (inc i) (size)))]\n      (when (not= i smallest)\n        (swap! i smallest)))))\n\n(sort!)")
 
 (def default-code
-  ";; Find the smallest remaining value, then put it in place.\n(defn sort! []\n  (doseq [i (range (size))]\n    (let [smallest\n          (reduce (fn [best j]\n                    (if (neg? (compare! j best)) j best))\n                  i\n                  (range (inc i) (size)))]\n      (when (not= i smallest)\n        (swap! i smallest)))))\n\n(sort!)")
+  ";; Return a function that accepts and returns immutable state.\n;; Each comparison returns [next-state ordering].\n(fn [state]\n  (reduce\n    (fn [state i]\n      (let [[state smallest]\n            (reduce (fn [[state best] j]\n                      (let [[state order] (compare-at state j best)]\n                        [state (if (neg? order) j best)]))\n                    [state i]\n                    (range (inc i) (size state)))]\n        (if (= i smallest)\n          state\n          (swap-at state i smallest))))\n    state\n    (range (size state))))")
+
+(defn legacy-code?
+  "Whether a draft references the retired mutable sorting API."
+  [code]
+  (and (string? code)
+       (boolean (re-find #"\b(?:compare!|swap!|write!|snapshot!|sort!)(?:\s|\)|\])" code))))
 
 (defn- finite-number? [x]
   (and (number? x) (js/Number.isFinite x)))
 
+(defn- natural-number? [x]
+  (and (finite-number? x) (integer? x) (<= 0 x)))
+
 (defn- error-message [error]
   (or (ex-message error) (.-message error) "The custom algorithm could not run."))
 
-(defn generate-trace
-  "Evaluate a fresh SCI context and return immutable frames.
+(def ^:private frame-keys [:values :active :sorted :comparisons :writes :note])
 
-  Only the instrumented functions below can inspect or change the working array.
-  No JavaScript globals or browser APIs are supplied to SCI. Call this in a Web
-  Worker: the UI also imposes a timeout for code that never calls our API."
-  [code values]
-  (let [frames (atom [])
-        limited? (atom false)]
+(defn- frame [state]
+  (select-keys state frame-keys))
+
+(defn- fail
+  ([message] (throw (ex-info message {})))
+  ([message state] (throw (ex-info message {:trace-state state}))))
+
+(defn- valid-index? [length index]
+  (and (integer? index) (<= 0 index) (< index length)))
+
+(defn- check-index [state index]
+  (let [length (count (:values state))]
+    (when-not (valid-index? length index)
+      (fail (str "Index " (pr-str index) " is outside the array (size " length ").") state)))
+  index)
+
+(defn- valid-frame? [length candidate]
+  (and (map? candidate)
+       (vector? (:values candidate))
+       (= length (count (:values candidate)))
+       (every? finite-number? (:values candidate))
+       (vector? (:active candidate))
+       (<= (count (:active candidate)) (max length 2))
+       (every? #(valid-index? length %) (:active candidate))
+       (vector? (:sorted candidate))
+       (<= (count (:sorted candidate)) length)
+       (every? #(valid-index? length %) (:sorted candidate))
+       (natural-number? (:comparisons candidate))
+       (natural-number? (:writes candidate))
+       (string? (:note candidate))
+       (<= (count (:note candidate)) 180)))
+
+(defn- validate-state
+  "Check the outer state without repeatedly traversing its entire history."
+  [length state]
+  (when-not (and (valid-frame? length state)
+                 (natural-number? (:operations state))
+                 (<= (:operations state) max-operations)
+                 (vector? (:frames state))
+                 (pos? (count (:frames state)))
+                 (< (count (:frames state)) max-frames))
+    (fail "Return a valid immutable state from the sorting function. Preserve its fields and use the supplied state operations."))
+  state)
+
+(defn- validate-trace [original initial state]
+  (validate-state (count original) state)
+  (when-not (and (= (first (:frames state)) (frame initial))
+                 (= (last (:frames state)) (frame state))
+                 (every? #(valid-frame? (count original) %) (:frames state))
+                 (= (:operations state) (dec (count (:frames state)))))
+    (fail "The returned trace has invalid frames. Keep the state and its history together using the supplied operations."))
+  state)
+
+(defn- record
+  "Append a new frame to a new state; previous states remain reusable."
+  [state active note transform]
+  ;; Reserve one frame for the final, verified result.
+  (when (or (>= (:operations state) max-operations)
+            (>= (count (:frames state)) (dec max-frames)))
+    (throw (ex-info "Stopped at the 20,000-operation/frame limit. Try a smaller array or a more efficient algorithm."
+                    {:type :operation-limit :trace-state state})))
+  (let [next-state (-> (transform state)
+                       (assoc :active active :note note)
+                       (update :operations inc))]
+    (update next-state :frames conj (frame next-state))))
+
+(defn- api-bindings [length]
+  {'size (fn [state]
+           (count (:values (validate-state length state))))
+   'value (fn [state index]
+            (validate-state length state)
+            (nth (:values state) (check-index state index)))
+   'compare-at (fn [state i j]
+                 (validate-state length state)
+                 (check-index state i)
+                 (check-index state j)
+                 (let [order (compare (nth (:values state) i) (nth (:values state) j))]
+                   [(record state [i j] (str "Compare positions " i " and " j ".")
+                            #(update % :comparisons inc))
+                    order]))
+   'swap-at (fn [state i j]
+              (validate-state length state)
+              (check-index state i)
+              (check-index state j)
+              (let [values (:values state)]
+                (record state [i j] (str "Swap positions " i " and " j ".")
+                        #(-> %
+                             (assoc :values (assoc values i (nth values j) j (nth values i)))
+                             (update :writes + (if (= i j) 0 2))))))
+   'write-at (fn [state index value]
+               (validate-state length state)
+               (check-index state index)
+               (when-not (finite-number? value)
+                 (fail "write-at needs a finite number." state))
+               (record state [index] (str "Write " value " at position " index ".")
+                       #(-> % (assoc-in [:values index] value) (update :writes inc))))
+   'snapshot (fn [state indices note]
+               (validate-state length state)
+               (when-not (sequential? indices)
+                 (fail "snapshot needs a vector or list of indices." state))
+               ;; Only realize a bounded prefix, including for infinite input.
+               (let [active (vec (take (inc length) indices))]
+                 (when (> (count active) length)
+                   (fail "snapshot has more indices than the array." state))
+                 (when-not (every? #(valid-index? length %) active)
+                   (check-index state (first (remove #(valid-index? length %) active))))
+                 (when-not (string? note)
+                   (fail "snapshot needs a string note." state))
+                 (record state active (subs note 0 (min 180 (count note))) identity)))})
+
+(defn- error-data [error]
+  ;; SCI may wrap a host exception. Preserve an operation's immutable partial
+  ;; trace when available, without holding a mutable reference to the last state.
+  (loop [error error depth 0]
+    (let [data (ex-data error)]
+      (if (or (:trace-state data) (>= depth 8) (nil? (ex-cause error)))
+        data
+        (recur (ex-cause error) (inc depth))))))
+
+(defn- run-code [code original]
+  (let [initial-frame {:values original :active [] :sorted []
+                       :comparisons 0 :writes 0 :note "Custom algorithm ready."}
+        initial (assoc initial-frame :operations 0 :frames [initial-frame])]
     (try
-      (when-not (and (string? code) (not (str/blank? code)))
-        (throw (ex-info "Add a ClojureScript sorting function and call it." {})))
-      (when-not (and (sequential? values) (every? finite-number? values))
-        (throw (ex-info "The array must contain only finite numbers." {})))
-      (let [original (vec values)
-            length (count original)
-            operations (atom 0)
-            state (atom {:values original
-                         :active []
-                         :sorted []
-                         :comparisons 0
-                         :writes 0
-                         :note "Custom algorithm ready."})
-            stop! (fn []
-                    (reset! limited? true)
-                    (throw (ex-info "Stopped at the 20,000-operation limit. Try a smaller array or a more efficient algorithm."
-                                    {:type :operation-limit})))
-            tick! (fn []
-                    (when (> (swap! operations inc) max-operations)
-                      (stop!)))
-            check-index! (fn [i]
-                           (when-not (and (integer? i) (<= 0 i) (< i length))
-                             (throw (ex-info (str "Index " (pr-str i) " is outside the array (size " length ").")
-                                             {:index i})))
-                           i)
-            record! (fn [active note]
-                      ;; Leave space for the final verified frame.
-                      (when (>= (count @frames) (dec max-frames))
-                        (stop!))
-                      (swap! state assoc :active (vec active) :note note)
-                      (swap! frames conj @state)
-                      nil)
-            bindings {'size (fn [] (tick!) length)
-                      'value (fn [i]
-                               (tick!)
-                               (nth (:values @state) (check-index! i)))
-                      'compare! (fn [i j]
-                                  (tick!)
-                                  (check-index! i)
-                                  (check-index! j)
-                                  (swap! state update :comparisons inc)
-                                  (record! [i j] (str "Compare positions " i " and " j "."))
-                                  (compare (nth (:values @state) i)
-                                           (nth (:values @state) j)))
-                      'swap! (fn [i j]
-                               (tick!)
-                               (check-index! i)
-                               (check-index! j)
-                               (let [current (:values @state)
-                                     a (nth current i)
-                                     b (nth current j)]
-                                 (swap! state #(-> %
-                                                   (assoc :values (assoc current i b j a))
-                                                   (update :writes + (if (= i j) 0 2))))
-                                 (record! [i j] (str "Swap positions " i " and " j "."))))
-                      'write! (fn [i value]
-                                (tick!)
-                                (check-index! i)
-                                (when-not (finite-number? value)
-                                  (throw (ex-info "write! needs a finite number." {})))
-                                (swap! state #(-> %
-                                                  (assoc-in [:values i] value)
-                                                  (update :writes inc)))
-                                (record! [i] (str "Write " value " at position " i ".")))
-                      'snapshot! (fn [indices note]
-                                   (tick!)
-                                   (when-not (sequential? indices)
-                                     (throw (ex-info "snapshot! needs a vector or list of indices." {})))
-                                   ;; Realize only a bounded prefix, even for lazy input.
-                                   (let [active (vec (take (inc length) indices))]
-                                     (when (> (count active) length)
-                                       (throw (ex-info "snapshot! has more indices than the array." {})))
-                                     (doseq [i active] (check-index! i))
-                                     (when-not (string? note)
-                                       (throw (ex-info "snapshot! needs a string note." {})))
-                                     (record! active (subs note 0 (min 180 (count note))))))}]
-        (swap! frames conj @state)
-        (sci/eval-string code {:namespaces {'user bindings}
-                               :classes {}
-                               :allow allowed-symbols})
-        (let [result (:values @state)]
+      (let [sorter (sci/eval-string code {:namespaces {'user (api-bindings (count original))}
+                                        :classes {}
+                                        :allow allowed-symbols})]
+        (when-not (fn? sorter)
+          (fail "The code must return a sorting function: (fn [state] ... next-state)."))
+        (let [state (validate-trace original initial (sorter initial))
+              result (:values state)]
           (cond
-            @limited?
-            {:frames @frames
-             :status :limited
-             :message "Stopped at the 20,000-operation limit. Try a smaller array or a more efficient algorithm."}
-
             (not= (frequencies original) (frequencies result))
-            {:frames @frames
-             :status :invalid
+            {:frames (:frames state) :status :invalid
              :message "The algorithm changed the array's values. A sort must preserve every original value."}
 
             (not= result (vec (sort result)))
-            {:frames @frames
-             :status :invalid
+            {:frames (:frames state) :status :invalid
              :message "The function finished, but the array is not sorted in ascending order."}
 
             :else
-            (do
-              (swap! state assoc :active [] :sorted (vec (range length))
-                     :note "Sorted! Every original value is preserved.")
-              (swap! frames conj @state)
-              {:frames @frames
-               :status :complete
-               :message "Custom algorithm completed and verified."}))))
+            {:frames (conj (:frames state)
+                           (assoc (frame state) :active [] :sorted (vec (range (count original)))
+                                  :note "Sorted! Every original value is preserved."))
+             :status :complete
+             :message "Custom algorithm completed and verified."})))
       (catch :default error
-        {:frames @frames
-         :status (if @limited? :limited :invalid)
-         :message (if @limited?
-                    "Stopped at the 20,000-operation limit. Try a smaller array or a more efficient algorithm."
-                    (error-message error))}))))
+        (let [data (error-data error)
+              partial (:trace-state data)
+              ;; Never return malformed frames, even if a program tampered with
+              ;; state before passing it into one of the operations.
+              frames (try
+                       (:frames (validate-trace original initial partial))
+                       (catch :default _ [initial-frame]))]
+          {:frames frames
+           :status (if (= :operation-limit (:type data)) :limited :invalid)
+           :message (error-message error)})))))
+
+(defn generate-trace
+  "Run a function of immutable state in a fresh SCI context.
+
+  The code must evaluate to (fn [state] ... next-state). The supplied operations
+  return new states; compare-at returns [next-state ordering]. State is explicit
+  and validated, not a security boundary. Run this in a Web Worker so the UI's
+  timeout also bounds computations that do not retain instrumented operations."
+  [code values]
+  (try
+    (when-not (and (string? code) (not (str/blank? code)))
+      (fail "Add a ClojureScript sorting function: (fn [state] ... next-state)."))
+    (when (legacy-code? code)
+      (fail "This draft uses the old mutable API. Return (fn [state] ... next-state), use compare-at/swap-at/write-at/snapshot with state, and carry each returned state forward. Reset the example to see the new API."))
+    (when-not (and (sequential? values) (every? finite-number? values))
+      (fail "The array must contain only finite numbers."))
+    (run-code code (vec values))
+    (catch :default error
+      {:frames [] :status :invalid :message (error-message error)})))
