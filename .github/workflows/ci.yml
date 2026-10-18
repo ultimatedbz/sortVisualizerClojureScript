@@ -1,4 +1,4 @@
-name: Build and test ClojureScript
+name: Build and test
 on:
   push:
     branches: [main]
@@ -25,3 +25,19 @@ jobs:
         with:
           name: static-site
           path: dist
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: niri-keybinds/package-lock.json
+      - run: python3 -m unittest discover -s advent-of-code/tests -v
+      - run: node --test zulip-mouse-navigation/tests/*.test.mjs
+      - run: npm ci --prefix niri-keybinds --ignore-scripts
+      - run: npm test --prefix niri-keybinds

@@ -6,6 +6,16 @@ The application is a static site built with ClojureScript, Reagent, React, and s
 
 [Open the hosted sorting lab](https://sort-visualizer-clojurescript.ultimatedbz.chatgpt.site). It is public and requires no sign-in.
 
+## Additional tools
+
+Each tool is independent of the sorting visualizer and has its own setup and usage instructions.
+
+| Folder | Purpose |
+| --- | --- |
+| [`zulip-mouse-navigation/`](zulip-mouse-navigation/) | A minimal Zulip source patch for side-button back/forward navigation, with an apply helper. |
+| [`advent-of-code/`](advent-of-code/) | Create a Clojure workspace for an Advent of Code year/day and cache its input using `AOC_SESSION`. |
+| [`niri-keybinds/`](niri-keybinds/) | List keybindings and actions from a niri KDL config and its recursive includes. |
+
 ## Explore
 
 - Quick, merge, heap, bubble, selection, insertion, gnome, shaker, odd-even, pancake, bitonic, radix, shell, comb, and bogo sort.

@@ -1,0 +1,16 @@
+// A synthetic config; every file visit must appear in this order.
+include "nested/workspaces.kdl"
+binds {
+    Mod+T hotkey-overlay-title="Terminal" { spawn "foot" "--title=work"; }
+    "Mod+Shift+P" repeat=false cooldown-ms=200 { spawn-sh r#"printf 'a;{b}' | cat"#; }
+    /- Mod+X { spawn "disabled"; }
+    Mod+H /- repeat=false { focus-column-left; }
+    Mod+Q hotkey-overlay-title=null { close-window; }
+    Mod+U { future-action "keep // this" value=9_007_199_254_740_993; }
+}
+/- include "never-read.kdl"
+include optional=true "missing-optional.kdl"
+include "nested/workspaces.kdl"
+recent-windows {
+    binds { Alt+Tab { next-window scope="workspace"; }; }
+}

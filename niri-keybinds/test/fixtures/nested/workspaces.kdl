@@ -1,0 +1,6 @@
+/* A nested /* block */ comment with binds { Fake { ignored; } } */
+include "leaf.kdl"
+binds {
+    Mod+T { spawn "alacritty"; }
+    Mod+1 { focus-workspace 1; }
+}

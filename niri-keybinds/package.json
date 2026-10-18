@@ -1,0 +1,10 @@
+{
+  "name": "niri-keybinds",
+  "version": "1.0.0",
+  "private": true,
+  "description": "List declared niri key bindings across recursive KDL includes",
+  "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {"test": "node --test"},
+  "dependencies": {"@bgotink/kdl": "0.4.1"}
+}

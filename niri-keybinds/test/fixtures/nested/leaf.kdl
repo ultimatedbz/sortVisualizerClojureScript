@@ -1,0 +1,4 @@
+binds {
+    Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+    /- MouseBack { close-window; }
+}

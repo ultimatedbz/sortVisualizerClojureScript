@@ -1,0 +1,26 @@
+diff --git a/web/src/desktop_integration.ts b/web/src/desktop_integration.ts
+index b2c5a85..f38657f 100644
+--- a/web/src/desktop_integration.ts
++++ b/web/src/desktop_integration.ts
+@@ -16,6 +16,21 @@ export function initialize(): void {
+         return;
+     }
+ 
++    $(document).on("mouseup", (event) => {
++        if (event.isDefaultPrevented()) {
++            return;
++        }
++
++        // Cancel Chromium's default navigation so each release moves only once.
++        if (event.button === 3) {
++            event.preventDefault();
++            window.history.back();
++        } else if (event.button === 4) {
++            event.preventDefault();
++            window.history.forward();
++        }
++    });
++
+     electron_bridge.on_event("logout", () => {
+         $("#logout_form").trigger("submit");
+     });

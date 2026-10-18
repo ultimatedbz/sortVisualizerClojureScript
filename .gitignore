@@ -7,3 +7,6 @@ dist/
 public/js/
 public/worker/
 .DS_Store
+__pycache__/
+*.py[cod]
+.venv/
